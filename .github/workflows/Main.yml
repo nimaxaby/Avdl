@@ -1,0 +1,257 @@
+name: '📥 AVASAM Downloader (Full - No Activation)'
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'لینک دانلود مستقیم'
+        required: true
+        type: string
+      mode:
+        description: 'حالت بسته‌بندی نهایی'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+        - normal
+        - zip
+      password:
+        description: 'رمز عبور برای فایل زیپ (اختیاری)'
+        required: false
+        type: string
+
+jobs:
+  download-files:
+    name: '📥 دانلود فایل ها'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: دریافت کد مخزن
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: تنظیمات گیت برای فایل‌های بزرگ
+        run: |
+          git config --global http.postBuffer 524288000
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: نصب ابزارهای مورد نیاز
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip curl bc
+
+      - name: دانلود و تقسیم فایل‌ها
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          URLS="${{ github.event.inputs.urls }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+          SPLIT_THRESHOLD_MB=95
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          BACKUP_DIR="/tmp/download_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+
+          mkdir -p downloads tmp_downloads
+
+          get_random_word() {
+            RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
+            echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"
+          }
+
+          get_unique_folder() {
+            local BASE_PATH="$1"
+            local NAME="$2"
+            if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then
+              echo "$NAME"
+              return
+            fi
+            local RANDOM_SUFFIX=$(get_random_word)
+            while [ -d "$BASE_PATH/${NAME}_${RANDOM_SUFFIX}" ] || [ -d "$BACKUP_DIR/${NAME}_${RANDOM_SUFFIX}" ]; do
+              RANDOM_SUFFIX=$(get_random_word)
+            done
+            echo "${NAME}_${RANDOM_SUFFIX}"
+          }
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          create_error_file() {
+            local FILENAME="$1"
+            local ERROR_MSG="$2"
+            local URL="$3"
+            local BASENAME_NO_EXT="${FILENAME%.*}"
+            local FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BASENAME_NO_EXT")
+            mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+            {
+              echo "# ${FILENAME} - Download Failed"
+              echo ""
+              echo "---"
+              echo "## Download Information"
+              echo "| Property | Value |"
+              echo "|----------|-------|"
+              echo "| **File** | \`${FILENAME}\` |"
+              echo "| **URL** | ${URL} |"
+              echo "| **Date** | $(date '+%Y-%m-%d %H:%M:%S UTC') |"
+              echo "| **Status** | **FAILED** |"
+              echo ""
+              echo "## Error Details"
+              echo "\`\`\`"
+              echo "$ERROR_MSG"
+              echo "\`\`\`"
+            } > "$BACKUP_DIR/$FOLDER_NAME/README.md"
+          }
+
+          download_with_retry() {
+            local URL="$1"
+            local FILENAME="$2"
+            local MAX_RETRIES=3
+            local RETRY_DELAY=5
+            local SUCCESS=false
+            local ERROR_LOG=""
+
+            for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
+              echo "Attempt $attempt of $MAX_RETRIES for $FILENAME"
+              rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
+              ERROR_LOG=$(aria2c \
+                --split=2 \
+                --max-connection-per-server=2 \
+                --min-split-size=20M \
+                --max-tries=3 \
+                --retry-wait=5 \
+                --timeout=60 \
+                --connect-timeout=30 \
+                --follow-torrent=false \
+                --check-certificate=false \
+                --allow-overwrite=true \
+                --auto-file-renaming=false \
+                --dir="tmp_downloads" \
+                --out="$FILENAME" \
+                "$URL" 2>&1)
+
+              if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
+                local FILE_SIZE=$(stat -c%s "tmp_downloads/$FILENAME" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 0 ]; then
+                  SUCCESS=true
+                  echo "Download successful: $FILENAME (${FILE_SIZE} bytes)"
+                  break
+                fi
+              fi
+
+              rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
+              echo "aria2c failed, trying curl fallback..."
+
+              ERROR_LOG=$(curl -L -f -# \
+                --retry 3 \
+                --retry-delay 5 \
+                --connect-timeout 30 \
+                --max-time 3600 \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                -o "tmp_downloads/$FILENAME" \
+                "$URL" 2>&1)
+
+              if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
+                local FILE_SIZE=$(stat -c%s "tmp_downloads/$FILENAME" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 0 ]; then
+                  SUCCESS=true
+                  echo "Download successful: $FILENAME (${FILE_SIZE} bytes)"
+                  break
+                fi
+              fi
+
+              rm -f "tmp_downloads/$FILENAME"
+              echo "Attempt $attempt failed. Waiting ${RETRY_DELAY}s before retry..."
+              sleep $RETRY_DELAY
+              RETRY_DELAY=$((RETRY_DELAY * 2))
+            done
+
+            if [ "$SUCCESS" = true ] && [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
+              return 0
+            fi
+
+            rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
+            create_error_file "$FILENAME" "Download failed after $MAX_RETRIES attempts. Last error: $ERROR_LOG" "$URL"
+            return 1
+          }
+
+          # دانلود تمام فایل‌ها
+          for URL in $URLS; do
+            FILENAME=$(basename "$URL" | sed 's/%20/ /g' | sed 's/%2F/-/g' | sed 's/[?#].*//')
+            FILENAME=$(echo "$FILENAME" | sed 's/[<>:"|?*]/_/g')
+            echo "Downloading $URL -> $FILENAME"
+            download_with_retry "$URL" "$FILENAME" || echo "Failed to download: $FILENAME"
+          done
+
+          # حالت ZIP: یک بسته شامل همه فایل‌ها
+          if [ "$MODE" = "zip" ]; then
+            if [ -n "$(ls -A tmp_downloads 2>/dev/null)" ]; then
+              ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S)"
+              FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$ARCHIVE_NAME")
+              mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+
+              VALID_FILES=()
+              for f in tmp_downloads/*; do
+                if [ -f "$f" ] && [ -s "$f" ]; then
+                  VALID_FILES+=("$f")
+                fi
+              done
+
+              if [ ${#VALID_FILES[@]} -gt 0 ]; then
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  zip -j -P "${ZIP_PASSWORD}" -s ${SPLIT_THRESHOLD_MB}m "${BACKUP_DIR}/${FOLDER_NAME}/${ARCHIVE_NAME}.zip" "${VALID_FILES[@]}"
+                else
+                  zip -j -s ${SPLIT_THRESHOLD_MB}m "${BACKUP_DIR}/${FOLDER_NAME}/${ARCHIVE_NAME}.zip" "${VALID_FILES[@]}"
+                fi
+              fi
+            fi
+          else
+            # حالت normal: هر فایل جداگانه ذخیره شود
+            for FILE in tmp_downloads/*; do
+              [ -f "$FILE" ] || continue
+              [ -s "$FILE" ] || continue
+
+              BASENAME=$(basename "$FILE")
+              BASENAME_NO_EXT="${BASENAME%.*}"
+              FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BASENAME_NO_EXT")
+              mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+
+              SIZE=$(stat -c%s "$FILE")
+              if [ "$SIZE" -gt $((SPLIT_THRESHOLD_MB * 1024 * 1024)) ]; then
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  zip -j -P "${ZIP_PASSWORD}" -s ${SPLIT_THRESHOLD_MB}m "${BACKUP_DIR}/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
+                else
+                  zip -j -s ${SPLIT_THRESHOLD_MB}m "${BACKUP_DIR}/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
+                fi
+              else
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  zip -j -P "${ZIP_PASSWORD}" "${BACKUP_DIR}/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
+                else
+                  zip -j "${BACKUP_DIR}/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
+                fi
+              fi
+            done
+          fi
+
+          rm -rf tmp_downloads
+
+          # کپی فایل‌ها به پوشه نهایی
+          if [ -d "$BACKUP_DIR" ]; then
+            for folder in "$BACKUP_DIR"/*; do
+              [ -d "$folder" ] || continue
+              FOLDER_NAME=$(basename "$folder")
+              mkdir -p "downloads/$FOLDER_NAME"
+              cp -r "$folder"/* "downloads/$FOLDER_NAME/"
+            done
+          fi
+
+      - name: انتشار فایل‌ها در مخزن
+        run: |
+          git add downloads/ -f
+          git commit -m "دانلود خودکار توسط GitHub Actions (بدون نیاز به فعال‌سازی)" || echo "تغییری وجود ندارد"
+          git push
